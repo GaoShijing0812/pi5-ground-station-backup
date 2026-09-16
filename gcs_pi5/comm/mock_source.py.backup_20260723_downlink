@@ -1,0 +1,70 @@
+"""假数据源 - 模拟飞机沿 planned_path 飞行 + 随机识别动物"""
+import random
+from PyQt5.QtCore import QTimer
+
+from comm.source_interface import MissionSource
+from models.animal import AnimalType
+from models.mission import Mission, AnimalSighting, MissionStatus
+
+
+class MockSource(MissionSource):
+    STEP_INTERVAL_MS = 400
+    ANIMAL_PROB = 0.15
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.mission = None
+        self.step_idx = 0
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._tick)
+
+    def start(self, mission: Mission):
+        if not mission.planned_path:
+            self.log_message.emit("[错误] 无航线，先规划再启动")
+            return
+        self.mission = mission
+        self.step_idx = 0
+        mission.status = MissionStatus.FLYING
+        mission.sightings.clear()
+        self.mission_started.emit()
+        self.log_message.emit(
+            f"任务开始，航点数 {len(mission.planned_path)}，"
+            f"预计耗时 {len(mission.planned_path) * self.STEP_INTERVAL_MS // 1000}s"
+        )
+        self.timer.start(self.STEP_INTERVAL_MS)
+
+    def stop(self):
+        if self.timer.isActive():
+            self.timer.stop()
+            if self.mission:
+                self.mission.status = MissionStatus.ABORTED
+            self.log_message.emit("任务已中止")
+
+    def _tick(self):
+        if not self.mission or self.step_idx >= len(self.mission.planned_path):
+            self._finish()
+            return
+
+        current = self.mission.planned_path[self.step_idx]
+        self.mission.current_position = current
+        self.position_updated.emit(current)
+
+        home = self.mission.planned_path[0]
+        if self.step_idx > 3 and current != home:
+            if random.random() < self.ANIMAL_PROB:
+                animal = random.choice(list(AnimalType))
+                count = random.randint(1, 2)
+                sighting = AnimalSighting(current, animal, count)
+                self.mission.add_sighting(sighting)
+                self.animal_sighted.emit(sighting)
+
+        self.step_idx += 1
+
+    def _finish(self):
+        self.timer.stop()
+        if self.mission:
+            self.mission.status = MissionStatus.LANDED
+        self.mission_finished.emit()
+        self.log_message.emit(
+            f"任务完成，共识别 {len(self.mission.sightings)} 次动物"
+        )

@@ -1,0 +1,34 @@
+# -*- coding: utf-8 -*-
+"""在队友已测通的 LoraSource2026 上,只加无人机 D 帧解析,不改他的文件。"""
+from comm.lora_source_2026 import LoraSource2026
+from models.drone_state import DroneState
+
+
+class DroneLoraSource2026(LoraSource2026):
+    # 无人机状态码 → DroneState,必须和飞控 User_Task.c 发送码一致
+    _DRONE_STATE_MAP = {
+        0: DroneState.IDLE,      1: DroneState.TAKEOFF,  2: DroneState.HOVER,
+        3: DroneState.SEARCH,    4: DroneState.FOLLOW,   5: DroneState.DROP,
+        6: DroneState.DESCEND,   7: DroneState.ONBOARD,  8: DroneState.RETURN,
+        9: DroneState.LANDING_H, 10: DroneState.LANDED,  99: DroneState.ERROR,
+    }
+
+    def _parse_line(self, line, now):
+        # 只拦无人机帧 D,state,x,y,alt;其它一律交回队友原逻辑
+        if line.startswith('D,'):
+            parts = line.split(',')
+            if len(parts) < 5:
+                return
+            try:
+                state_code = int(parts[1])
+                x_cm = float(parts[2])
+                y_cm = float(parts[3])
+                alt_cm = float(parts[4])
+            except ValueError:
+                return  # 撞坏的帧丢掉,下一帧补
+            st = self._DRONE_STATE_MAP.get(state_code, DroneState.ERROR)
+            self.drone_state.emit(st)
+            self.drone_pos.emit(x_cm, y_cm, 0.0, alt_cm)  # yaw 暂 0
+            return
+        # 不是 D 帧 → 原样交回队友的 P 帧 / 非P帧处理
+        return super()._parse_line(line, now)

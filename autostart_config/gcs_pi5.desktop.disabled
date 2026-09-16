@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=GCS Pi5 地面站
+Comment=2025 电赛 H 题地面站，开机自启
+Exec=bash -c 'sleep 5 && python3 /home/wheeltec/gcs_pi5/main.py >> /home/wheeltec/gcs_pi5/data/autostart.log 2>&1'
+Terminal=false
+Hidden=false
+X-GNOME-Autostart-enabled=true
+X-MATE-Autostart-enabled=true
+StartupNotify=false

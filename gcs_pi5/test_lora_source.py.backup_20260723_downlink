@@ -1,0 +1,171 @@
+"""LoraSource 离线单测 - 不接真硬件,喂假字节流验证 parser 各分支
+
+跑法: cd /home/wheeltec/gcs_pi5 && python3 -m unittest test_lora_source -v
+"""
+import sys
+import unittest
+from PyQt5.QtCore import QCoreApplication
+
+from comm.lora_source import LoraSource, FRAME_LEN, HEADER, TRAILER
+from models.animal import AnimalType
+from models.grid import GridCell
+
+
+_app = QCoreApplication.instance() or QCoreApplication(sys.argv)
+
+
+def make_frame(type_val: int, count: int, a: int, b: int) -> bytes:
+    """按飞控 byte2hex 造一帧 12 字节 ASCII 帧"""
+    return f"BB{type_val:02X}{count:02X}{a:02X}{b:02X}CC".encode('ascii')
+
+
+def drive(source: LoraSource, data: bytes):
+    """喂字节 + 手动跑 parser 循环(绕开真串口的 readyRead)"""
+    source._rx_buffer.extend(data)
+    while len(source._rx_buffer) >= FRAME_LEN:
+        if not source._try_parse_one_frame():
+            source._rx_buffer.pop(0)
+
+
+class LoraSourceParserTests(unittest.TestCase):
+
+    def setUp(self):
+        self.source = LoraSource(port_name='/tmp/dummy_not_used_in_tests')
+        # 挂 dummy mission 让 parser 走完整路径(等价于"开始巡查"后)
+        from models.mission import Mission
+        self.source.mission = Mission()
+        self.positions = []
+        self.sightings = []
+        self.logs = []
+        self.source.position_updated.connect(lambda c: self.positions.append(c))
+        self.source.animal_sighted.connect(lambda s: self.sightings.append(s))
+        self.source.log_message.connect(lambda m: self.logs.append(m))
+
+    # ------- 正常路径 -------
+    def test_normal_frame_tiger(self):
+        drive(self.source, make_frame(4, 3, 5, 3))
+        self.assertEqual(self.source._frames_ok, 1)
+        self.assertEqual(self.source._frames_bad, 0)
+        self.assertEqual(len(self.positions), 1)
+        self.assertEqual(self.positions[0], GridCell(5, 3))
+        self.assertEqual(len(self.sightings), 1)
+        self.assertEqual(self.sightings[0].animal, AnimalType.TIGER)
+        self.assertEqual(self.sightings[0].count, 3)
+        self.assertEqual(self.sightings[0].cell, GridCell(5, 3))
+        self.assertEqual(len(self.source._rx_buffer), 0)
+
+    def test_normal_frame_elephant(self):
+        drive(self.source, make_frame(0, 1, 1, 1))
+        self.assertEqual(self.source._frames_ok, 1)
+        self.assertEqual(self.sightings[0].animal, AnimalType.ELEPHANT)
+
+    def test_all_five_animals(self):
+        expected = [
+            AnimalType.ELEPHANT, AnimalType.MONKEY, AnimalType.PEACOCK,
+            AnimalType.WOLF, AnimalType.TIGER,
+        ]
+        for t in range(5):
+            drive(self.source, make_frame(t, 1, 1, 1))
+        self.assertEqual(self.source._frames_ok, 5)
+        self.assertEqual([s.animal for s in self.sightings], expected)
+
+    # ------- 帧结构错误 -------
+    def test_bad_header(self):
+        drive(self.source, b'XX' + b'04030503' + b'CC')
+        self.assertEqual(self.source._frames_ok, 0)
+        self.assertGreaterEqual(self.source._frames_bad, 1)
+        self.assertEqual(len(self.positions), 0)
+        self.assertTrue(any('帧头错' in m for m in self.logs))
+
+    def test_bad_trailer(self):
+        drive(self.source, b'BB' + b'04030503' + b'XX')
+        self.assertEqual(self.source._frames_ok, 0)
+        self.assertGreaterEqual(self.source._frames_bad, 1)
+        self.assertTrue(any('帧尾错' in m for m in self.logs))
+
+    def test_bad_hex_mid(self):
+        drive(self.source, b'BB' + b'ZZ030503' + b'CC')
+        self.assertEqual(self.source._frames_ok, 0)
+        self.assertEqual(self.source._frames_bad, 1)
+        self.assertTrue(any('十六进制' in m for m in self.logs))
+        self.assertEqual(len(self.source._rx_buffer), 0)
+
+    def test_type_overflow(self):
+        drive(self.source, make_frame(5, 1, 1, 1))
+        self.assertEqual(self.source._frames_ok, 0)
+        self.assertTrue(any('type 越界' in m for m in self.logs))
+        self.assertEqual(len(self.source._rx_buffer), 0)
+
+    def test_cell_out_of_range_a(self):
+        drive(self.source, make_frame(0, 1, 15, 3))
+        self.assertEqual(self.source._frames_ok, 0)
+        self.assertTrue(any('格子越界' in m for m in self.logs))
+
+    def test_cell_out_of_range_b(self):
+        drive(self.source, make_frame(0, 1, 5, 8))
+        self.assertEqual(self.source._frames_ok, 0)
+        self.assertTrue(any('格子越界' in m for m in self.logs))
+
+    def test_count_zero(self):
+        drive(self.source, make_frame(0, 0, 5, 3))
+        self.assertEqual(self.source._frames_ok, 0)
+        self.assertTrue(any('数量为 0' in m for m in self.logs))
+
+    # ------- 流式 / 连包 / 半帧 -------
+    def test_back_to_back_frames(self):
+        data = make_frame(4, 3, 5, 3) + make_frame(0, 1, 1, 1)
+        drive(self.source, data)
+        self.assertEqual(self.source._frames_ok, 2)
+        self.assertEqual(len(self.sightings), 2)
+        self.assertEqual(self.sightings[0].animal, AnimalType.TIGER)
+        self.assertEqual(self.sightings[1].animal, AnimalType.ELEPHANT)
+        self.assertEqual(self.positions[0], GridCell(5, 3))
+        self.assertEqual(self.positions[1], GridCell(1, 1))
+
+    def test_half_frame_no_parse(self):
+        drive(self.source, b'BB0403')
+        self.assertEqual(self.source._frames_ok, 0)
+        self.assertEqual(self.source._frames_bad, 0)
+        self.assertEqual(len(self.source._rx_buffer), 6)
+
+    def test_half_then_complete(self):
+        drive(self.source, b'BB0403')
+        drive(self.source, b'0503CC')
+        self.assertEqual(self.source._frames_ok, 1)
+        self.assertEqual(self.sightings[0].animal, AnimalType.TIGER)
+
+    def test_garbage_then_frame(self):
+        good = make_frame(0, 1, 1, 1)
+        drive(self.source, b'\x00\x01AB\xff' + good)
+        self.assertEqual(self.source._frames_ok, 1)
+        self.assertGreaterEqual(self.source._frames_bad, 1)
+        self.assertEqual(self.sightings[0].cell, GridCell(1, 1))
+
+    def test_signal_order(self):
+        emitted_order = []
+        s = LoraSource(port_name='/tmp/dummy2')
+        from models.mission import Mission
+        s.mission = Mission()
+        s.position_updated.connect(lambda c: emitted_order.append('pos'))
+        s.animal_sighted.connect(lambda x: emitted_order.append('animal'))
+        s._rx_buffer.extend(make_frame(0, 1, 1, 1))
+        s._try_parse_one_frame()
+        self.assertEqual(emitted_order, ['pos', 'animal'])
+
+    def test_frame_dropped_when_no_mission(self):
+        """stop 后 mission=None,收到帧应该丢弃 + 报错日志"""
+        s = LoraSource(port_name='/tmp/dummy_no_mission')
+        logs, positions, sightings = [], [], []
+        s.log_message.connect(lambda m: logs.append(m))
+        s.position_updated.connect(lambda c: positions.append(c))
+        s.animal_sighted.connect(lambda x: sightings.append(x))
+        drive(s, make_frame(0, 1, 5, 4))
+        self.assertEqual(s._frames_ok, 0)
+        self.assertEqual(s._frames_bad, 1)
+        self.assertEqual(len(positions), 0)
+        self.assertEqual(len(sightings), 0)
+        self.assertTrue(any('未开始或已结束' in m for m in logs))
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

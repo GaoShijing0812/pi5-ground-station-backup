@@ -1,0 +1,33 @@
+"""动物种类枚举 - 2025 H 题 5 种"""
+from enum import IntEnum
+
+
+class AnimalType(IntEnum):
+    """
+    动物种类。int 值同时用作：
+    (a) 内部索引
+    (b) 通信协议里的动物 ID
+
+    ⚠️ 真实 K230 传输时用的 ID 需在接通信前对齐。
+       届时改这里 5 个数字即可，UI 代码和存储代码不受影响。
+    """
+    ELEPHANT = 1   # 象
+    TIGER    = 2   # 虎
+    WOLF     = 3   # 狼
+    MONKEY   = 4   # 猴
+    PEACOCK  = 5   # 孔雀
+
+
+# UI 显示用的中文名
+ANIMAL_NAMES_CN = {
+    AnimalType.ELEPHANT: "象",
+    AnimalType.TIGER:    "虎",
+    AnimalType.WOLF:     "狼",
+    AnimalType.MONKEY:   "猴",
+    AnimalType.PEACOCK:  "孔雀",
+}
+
+
+def name_of(animal: AnimalType) -> str:
+    """获取动物中文名"""
+    return ANIMAL_NAMES_CN[animal]

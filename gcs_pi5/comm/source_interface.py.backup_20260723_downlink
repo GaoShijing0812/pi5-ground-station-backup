@@ -1,0 +1,23 @@
+"""任务数据源抽象接口 - 阶段 1 (mock) & 阶段 2 (lora) 共用"""
+from PyQt5.QtCore import QObject, pyqtSignal
+
+from models.grid import GridCell
+from models.mission import Mission, AnimalSighting
+
+
+class MissionSource(QObject):
+    """数据源基类。UI 只订阅信号，不关心数据来自 mock 还是 LoRa。"""
+
+    position_updated  = pyqtSignal(GridCell)
+    animal_sighted    = pyqtSignal(AnimalSighting)
+    mission_started   = pyqtSignal()
+    mission_finished  = pyqtSignal()
+    log_message       = pyqtSignal(str)
+
+    def start(self, mission: Mission):
+        """开始一次任务。子类实现。"""
+        raise NotImplementedError
+
+    def stop(self):
+        """停止当前任务。子类实现。"""
+        raise NotImplementedError

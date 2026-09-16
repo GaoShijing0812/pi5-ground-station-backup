@@ -1,0 +1,31 @@
+"""地面站全局配置常量 - 按 2025 H 题定义"""
+
+# ===== 场地参数（2025 H 题）=====
+GRID_COLS = 9        # 横向 A1..A9
+GRID_ROWS = 7        # 纵向 B1..B7
+GRID_CM = 50         # 每格 50cm
+
+# 场地物理尺寸
+FIELD_WIDTH_CM = GRID_COLS * GRID_CM    # 450 cm
+FIELD_HEIGHT_CM = GRID_ROWS * GRID_CM   # 350 cm
+
+# 起飞高度（题目要求 120±10 cm）
+TAKEOFF_ALT_CM = 120
+
+# 巡查时限（题目要求 ≤ 300s）
+MISSION_TIME_LIMIT_S = 300
+
+# 起飞点（memory 记录：A9B1 = 右下角）
+HOME_A = 9   # A9
+HOME_B = 1   # B1
+
+# 禁飞区数量（2025 题目：3 个连续方格）
+FORBIDDEN_COUNT = 3
+
+# ===== UI 尺寸（贴合轮趣 7 寸屏主流 1024x600）=====
+WINDOW_WIDTH = 1024
+WINDOW_HEIGHT = 600
+
+# ===== 存储 =====
+import os
+DATA_DIR = os.path.expanduser("~/gcs_pi5/data")  # 任务日志保存目录

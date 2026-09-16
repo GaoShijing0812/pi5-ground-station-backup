@@ -1,0 +1,252 @@
+"""LoRa 数据源 - 阶段 2 真实数据源
+
+从飞控 UART1 (LoRa @115200) 接收 12 字节 ASCII 动物识别帧,替换 MockSource。
+
+## 上行帧格式(源:2025 飞控 FcSrc/User_Task.c: Report_Animals)
+
+    'B''B'  T1 T0   N1 N0   A1 A0   B1 B0   'C''C'
+    帧头     类型     数量    A列     B行      帧尾
+    (12 字节全 ASCII,byte2hex 编码每字段两位十六进制)
+
+Type 编码(与 AnimalType 对齐):
+    0=大象 1=猴子 2=孔雀 3=狼 4=老虎
+
+例:A5B3 3 只老虎 -> 字节流 42 42 30 34 30 33 30 35 30 33 43 43
+
+## 关键约束
+
+- 飞控每格稳定 2s 才发,遍历 5 种动物,count>0 才发一帧
+- 一个巡查任务总量约 60-120 帧
+- ⚠️ 无 CRC 校验,只靠 'BB'/'CC' 定界
+- ⚠️ 2025 飞控**不上传实时位置**,飞机位置从帧里 A/B 推导(每 2-4s 跳一格)
+- ⚠️ 无"任务结束"帧,mission_finished 只在 stop() 里 emit(用户手动结束)
+
+## 解析策略(严格模式)
+
+- 遇到非 BB 帧头 -> log_message 报错,丢 1 字节自动同步
+- 帧头对但帧尾错 -> log_message 报错,丢 1 字节
+- 头尾都对但中间乱(非十六进制/type 越界/格子越界) -> log_message 报错,丢整帧
+"""
+from typing import Optional
+
+from PyQt5.QtCore import pyqtSlot
+from PyQt5.QtSerialPort import QSerialPort
+
+from comm.source_interface import MissionSource
+from models.animal import AnimalType
+from models.grid import GridCell
+from models.mission import Mission, MissionStatus, AnimalSighting
+
+
+# ---- 帧结构常量 ----
+FRAME_LEN = 12
+HEADER    = b'BB'
+TRAILER   = b'CC'
+
+
+class LoraSource(MissionSource):
+    """通过串口收 12 字节动物帧,把接口跟 MockSource 保持一致。"""
+
+    def __init__(
+        self,
+        port_name: str = '/dev/ttyAMA10',
+        baudrate: int = 115200,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.port_name = port_name
+        self.baudrate = baudrate
+
+        self.mission: Optional[Mission] = None
+        self._rx_buffer = bytearray()
+        self._frames_ok = 0
+        self._frames_bad = 0
+
+        self._serial = QSerialPort(self)
+        self._serial.setPortName(self.port_name)
+        self._serial.setBaudRate(self.baudrate)
+        self._serial.setDataBits(QSerialPort.Data8)
+        self._serial.setParity(QSerialPort.NoParity)
+        self._serial.setStopBits(QSerialPort.OneStop)
+        self._serial.setFlowControl(QSerialPort.NoFlowControl)
+        self._serial.readyRead.connect(self._on_ready_read)
+
+    # ---- MissionSource 接口 ----
+    def start(self, mission: Mission):
+        if not mission.planned_path:
+            self.log_message.emit("[错误] 无航线,先规划再启动")
+            return
+
+        if not self._serial.isOpen():
+            if not self._serial.open(QSerialPort.ReadWrite):
+                err = self._serial.errorString()
+                self.log_message.emit(
+                    f"[错误] 打开 {self.port_name} 失败: {err}"
+                )
+                return
+            self.log_message.emit(
+                f"串口已开: {self.port_name} @ {self.baudrate}"
+            )
+
+        self.mission = mission
+        mission.status = MissionStatus.FLYING
+        mission.sightings.clear()
+        mission.current_position = None
+        self._rx_buffer.clear()
+        self._frames_ok = 0
+        self._frames_bad = 0
+
+        self.mission_started.emit()
+        self.log_message.emit(
+            f"任务开始,航点 {len(mission.planned_path)},等待飞控回传..."
+        )
+
+    def stop(self):
+        if self.mission is None:
+            return
+        if self.mission.status == MissionStatus.FLYING:
+            self.mission.status = MissionStatus.LANDED
+            self.log_message.emit(
+                f"任务结束(手动),识别 {len(self.mission.sightings)} 次 | "
+                f"OK {self._frames_ok} / 错 {self._frames_bad}"
+            )
+            self.mission_finished.emit()
+        self.mission = None
+        # 串口保持打开,下次 start 复用
+
+    # ---- 下行:发航线到飞控 ----
+    @staticmethod
+    def _build_waypoints_frame(cells) -> bytes:
+        """按 0xAA 0xFC [N] [A1 B1 ... AN BN] 0xEE 构造下行帧"""
+        if not cells:
+            raise ValueError("空航线")
+        if len(cells) > 255:
+            raise ValueError(f"航点数 {len(cells)} 超过 255 (飞控 u8 装不下)")
+        frame = bytearray([0xAA, 0xFC, len(cells)])
+        for cell in cells:
+            frame.append(cell.a)
+            frame.append(cell.b)
+        frame.append(0xEE)
+        return bytes(frame)
+
+    def send_waypoints(self, cells) -> bool:
+        """把航线发到飞控 (触发点: main.py 的 on_start, 开始巡查前先发)"""
+        try:
+            frame = self._build_waypoints_frame(cells)
+        except ValueError as e:
+            self.log_message.emit(f"[错误] {e}")
+            return False
+
+        if not self._serial.isOpen():
+            if not self._serial.open(QSerialPort.ReadWrite):
+                err = self._serial.errorString()
+                self.log_message.emit(f"[错误] 打开 {self.port_name} 失败: {err}")
+                return False
+            self.log_message.emit(f"串口已开: {self.port_name} @ {self.baudrate}")
+
+        written = self._serial.write(bytes(frame))
+        self._serial.flush()
+        ok = (written == len(frame))
+        if ok:
+            self.log_message.emit(f"航线已发: {len(cells)} 点 ({len(frame)} 字节)")
+        else:
+            self.log_message.emit(f"[错误] 航线发送不完整: 应 {len(frame)} 实 {written}")
+        return ok
+
+    # ---- 串口回调 ----
+    @pyqtSlot()
+    def _on_ready_read(self):
+        data = bytes(self._serial.readAll())
+        if not data:
+            return
+        self._rx_buffer.extend(data)
+
+        while len(self._rx_buffer) >= FRAME_LEN:
+            if not self._try_parse_one_frame():
+                self._rx_buffer.pop(0)
+
+    def _try_parse_one_frame(self) -> bool:
+        """
+        尝试从 buffer 前 12 字节解析一帧。
+        返回 True 表示已消费(不管成功还是丢整帧),False 表示需要丢 1 字节继续。
+        """
+        buf = self._rx_buffer
+
+        # 1. 帧头
+        if buf[0:2] != HEADER:
+            self._frames_bad += 1
+            self.log_message.emit(
+                f"[丢帧] 帧头错: 期望 b'BB' 得 {bytes(buf[0:2])!r}"
+            )
+            return False
+
+        # 2. 帧尾
+        if buf[10:12] != TRAILER:
+            self._frames_bad += 1
+            self.log_message.emit(
+                f"[丢帧] 帧尾错: 期望 b'CC' 得 {bytes(buf[10:12])!r}"
+            )
+            return False
+
+        # 3. 中间 8 字节:两两解 hex
+        try:
+            type_val  = int(buf[2:4].decode('ascii'), 16)
+            count_val = int(buf[4:6].decode('ascii'), 16)
+            a_col     = int(buf[6:8].decode('ascii'), 16)
+            b_row     = int(buf[8:10].decode('ascii'), 16)
+        except (ValueError, UnicodeDecodeError) as e:
+            self._frames_bad += 1
+            self.log_message.emit(f"[丢帧] 十六进制解析失败: {e}")
+            del self._rx_buffer[:FRAME_LEN]
+            return True
+
+        # 4. 语义校验:type
+        if type_val > 4:
+            self._frames_bad += 1
+            self.log_message.emit(
+                f"[丢帧] 动物 type 越界: {type_val} (只支持 0-4)"
+            )
+            del self._rx_buffer[:FRAME_LEN]
+            return True
+
+        # 5. 语义校验:格子
+        try:
+            cell = GridCell(a_col, b_row)
+        except ValueError:
+            self._frames_bad += 1
+            self.log_message.emit(
+                f"[丢帧] 格子越界: A{a_col}B{b_row}"
+            )
+            del self._rx_buffer[:FRAME_LEN]
+            return True
+
+        # 6. count 为 0 也算异常
+        if count_val == 0:
+            self._frames_bad += 1
+            self.log_message.emit(
+                f"[丢帧] 数量为 0 (飞控本不该发这种帧)"
+            )
+            del self._rx_buffer[:FRAME_LEN]
+            return True
+
+        # 7. 检查任务状态:未 start 或已 stop 时不该处理任何帧
+        if self.mission is None:
+            del self._rx_buffer[:FRAME_LEN]
+            self._frames_bad += 1
+            self.log_message.emit(
+                '[丢帧] 任务未开始或已结束 (未点"开始巡查")'
+            )
+            return True
+
+        # 8. 一切正常
+        del self._rx_buffer[:FRAME_LEN]
+        self._frames_ok += 1
+
+        animal = AnimalType(type_val)
+        sighting = AnimalSighting(cell, animal, count_val)
+        self.mission.current_position = cell
+        self.mission.add_sighting(sighting)
+
+        self.position_updated.emit(cell)
+        self.animal_sighted.emit(sighting)
+        return True

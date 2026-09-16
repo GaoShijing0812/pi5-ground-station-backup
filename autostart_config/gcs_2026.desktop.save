@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=GCS 2026 地面站
+Comment=2026 电赛 D 题地面站，开机自启
+Exec=bash -c 'sleep 5 && python3 /home/wheeltec/Dgcs_2026/main_2026.py >> /home/wheeltec/gcs_2026/autostart.log 2>&1'
+Terminal=false
+Hidden=false
+X-GNOME-Autostart-enabled=true
+X-MATE-Autostart-enabled=true
+StartupNotify=false
