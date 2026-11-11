@@ -6,7 +6,7 @@ UI 只认这些信号，不关心数据从哪来。
 - 现在：MockSource2026（QTimer 假数据，演示用）
 - 将来：LoraSource2026（读 LoRa 真机遥测），实现同一套信号，UI 一行不改。
 
-⚠️ 小车位置数据源未定（回传/时间推算/无人机视觉估计三选一），
+小车位置数据源未定（回传/时间推算/无人机视觉估计三选一），
    等定了只需新增一个 Source 子类，car_pos 信号照样发。
 """
 from PyQt5.QtCore import QObject, pyqtSignal
